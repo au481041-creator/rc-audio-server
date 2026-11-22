@@ -56,6 +56,14 @@
       margin-top: 20px;
       color: #90caf9;
     }
+    .tip {
+      margin-top: 14px;
+      font-size: 13px;
+      color: #aaa;
+      max-width: 420px;
+      margin-left: auto;
+      margin-right: auto;
+    }
   </style>
 </head>
 <body>
@@ -77,6 +85,7 @@
   </div>
 
   <div id="status">স্ট্যাটাস: সংযোগ হচ্ছে...</div>
+  <div class="tip">টিপস: রিপিট/ইকো এড়াতে একসাথে Talk ও Listen চালু না রেখে পালাক্রমে ব্যবহার করুন।</div>
 
   <script>
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
@@ -88,6 +97,7 @@
     const voiceSelect = document.getElementById("voiceSelect");
 
     let audioCtx = null;
+    let gainNode = null;
     let nextPlayTime = 0;
     let isTalking = false;
     let micStream = null;
@@ -115,6 +125,9 @@
         audioCtx = new (window.AudioContext || window.webkitAudioContext)({
           sampleRate: 16000
         });
+        gainNode = audioCtx.createGain();
+        gainNode.gain.value = 2.2; // অডিও স্পষ্টতার জন্য ভলিউম বুস্ট
+        gainNode.connect(audioCtx.destination);
         nextPlayTime = audioCtx.currentTime;
       }
       if (audioCtx.state === "suspended") {
@@ -122,7 +135,7 @@
       }
     }
 
-    // আসা 16-bit PCM অডিও বাজানো
+    // আসা 16-bit PCM অডিও বাজানো (পুরোনো বাফার জমে গেলে লাইভ সময়ে সিঙ্ক করা হয়)
     ws.onmessage = async (event) => {
       if (!audioCtx || audioCtx.state !== "running") return;
 
@@ -143,14 +156,20 @@
 
       const source = audioCtx.createBufferSource();
       source.buffer = audioBuffer;
-      source.connect(audioCtx.destination);
+      source.connect(gainNode);
 
       const now = audioCtx.currentTime;
-      if (nextPlayTime < now) {
-        nextPlayTime = now + 0.02;
+      // ১০-১২ সেকেন্ডের বাফার ল্যাগ আটকাতে 0.25s এর বেশি পিছিয়ে গেলে রিসেট
+      if (nextPlayTime < now || (nextPlayTime - now) > 0.25) {
+        nextPlayTime = now + 0.03;
       }
       source.start(nextPlayTime);
       nextPlayTime += audioBuffer.duration;
+    };
+
+    listenBtn.onclick = () => {
+      ensureAudioContext();
+      statusEl.textContent = "স্ট্যাটাস: Listen চালু আছে (অডিও শোনা যাবে)";
     };
 
     // পিচ পরিবর্তনের জন্য লিনিয়ার রিস্যাম্পলিং
@@ -193,7 +212,6 @@
       }
 
       if (mode === "deep") {
-        // পিচ কমিয়ে গম্ভীর কণ্ঠ
         const shifted = applyPitchShift(inputSamples, 0.78);
         const out = new Float32Array(shifted.length);
         for (let i = 0; i < shifted.length; i++) {
@@ -204,7 +222,6 @@
       }
 
       if (mode === "high") {
-        // পিচ বাড়িয়ে চিকন কণ্ঠ
         const shifted = applyPitchShift(inputSamples, 1.32);
         const out = new Float32Array(shifted.length);
         for (let i = 0; i < shifted.length; i++) {
@@ -214,7 +231,6 @@
       }
 
       if (mode === "robot") {
-        // রিং মডুলেশন দিয়ে রোবট ইফেক্ট
         const out = new Float32Array(inputSamples.length);
         const carrierFreq = 95;
         const step = (2 * Math.PI * carrierFreq) / 16000;
@@ -228,19 +244,14 @@
       }
 
       if (mode === "walkie") {
-        // ওয়াকিটকির মতো ব্যান্ড-পাস + হালকা ডিস্টরশন
         const out = new Float32Array(inputSamples.length);
         for (let i = 0; i < inputSamples.length; i++) {
           const x = inputSamples[i];
-          // হাই-পাস ফিল্টার (নিচের অতিরিক্ত বেস কমানো)
           const hp = 0.85 * (hpState + x - prevSample);
           hpState = hp;
           prevSample = x;
 
-          // লো-পাস ফিল্টার (উপরের হিস শব্দ কমানো)
           lpState = lpState + 0.28 * (hp - lpState);
-
-          // হালকা ওয়াকিটকি ক্লিপিং
           const clipped = Math.max(-0.55, Math.min(0.55, lpState * 1.8));
           out[i] = clipped * 1.35;
         }

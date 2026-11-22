@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>RC Car Two-Way Audio</title>
+  <title>RC Car Live Two-Way Audio</title>
   <style>
     body {
       font-family: Arial, sans-serif;
@@ -28,53 +28,56 @@
       background: #43a047;
       color: #fff;
     }
-    .voice-box {
-      margin: 18px auto 8px;
-      max-width: 340px;
+    .control-box {
+      margin: 16px auto;
+      max-width: 360px;
       background: #1e1e1e;
-      padding: 12px 16px;
+      padding: 14px 16px;
       border-radius: 10px;
       border: 1px solid #333;
     }
-    .voice-box label {
+    .control-box label {
       display: block;
       margin-bottom: 8px;
       font-size: 14px;
       color: #bbdefb;
     }
-    select#voiceSelect {
+    select, input[type="range"] {
       width: 100%;
+      margin-top: 4px;
+      cursor: pointer;
+    }
+    select {
       padding: 10px 12px;
       font-size: 15px;
       border-radius: 6px;
       border: none;
       background: #2c2c2c;
       color: #fff;
-      cursor: pointer;
     }
     #status {
       margin-top: 20px;
       color: #90caf9;
     }
-    .tip {
-      margin-top: 14px;
+    .note {
+      margin-top: 12px;
       font-size: 13px;
       color: #aaa;
-      max-width: 420px;
+      max-width: 440px;
       margin-left: auto;
       margin-right: auto;
     }
   </style>
 </head>
 <body>
-  <h2>RC Car Audio Console</h2>
-  <p>দূর থেকে কথা বলা ও গাড়ির অডিও শোনার কন্ট্রোল প্যানেল</p>
+  <h2>RC Car Live Audio Console</h2>
+  <p>লাইভ কথা বলা ও গাড়ির অডিও শোনার কন্ট্রোল প্যানেল</p>
 
   <button id="listenBtn">Listen (শুনুন)</button>
   <button id="talkBtn">Talk (কথা বলুন)</button>
 
-  <div class="voice-box">
-    <label for="voiceSelect">ভয়েস মোড বেছে নিন (কথা বলার আগে বা মাঝে):</label>
+  <div class="control-box">
+    <label for="voiceSelect">ভয়েস মোড বেছে নিন:</label>
     <select id="voiceSelect">
       <option value="normal" selected>Normal (স্বাভাবিক)</option>
       <option value="deep">Deep / গম্ভীর কণ্ঠ</option>
@@ -84,33 +87,49 @@
     </select>
   </div>
 
+  <div class="control-box">
+    <label for="txGainRange">স্পিকার ভলিউম বুস্ট (পাঠানো ভয়েস): <span id="txGainVal">3.2x</span></label>
+    <input id="txGainRange" type="range" min="1.0" max="6.0" step="0.2" value="3.2" />
+  </div>
+
   <div id="status">স্ট্যাটাস: সংযোগ হচ্ছে...</div>
-  <div class="tip">টিপস: রিপিট/ইকো এড়াতে একসাথে Talk ও Listen চালু না রেখে পালাক্রমে ব্যবহার করুন।</div>
+  <div class="note">
+    সুরক্ষা ও দ্রুত সাউন্ডের জন্য: ০.০৮ সেকেন্ডের বেশি পুরোনো অডিও বাফার স্বয়ংক্রিয়ভাবে বাদ দেওয়া হবে। কথা বলার সময় একসাথে Listen চালু না রাখলে রিপিট হবে না।
+  </div>
 
   <script>
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(`${protocol}//${location.host}`);
+    ws.binaryType = "arraybuffer";
 
     const statusEl = document.getElementById("status");
     const listenBtn = document.getElementById("listenBtn");
     const talkBtn = document.getElementById("talkBtn");
     const voiceSelect = document.getElementById("voiceSelect");
+    const txGainRange = document.getElementById("txGainRange");
+    const txGainVal = document.getElementById("txGainVal");
 
     let audioCtx = null;
-    let gainNode = null;
+    let rxGainNode = null;
     let nextPlayTime = 0;
     let isTalking = false;
+    let isListening = false;
     let micStream = null;
     let processor = null;
     let micSource = null;
+    let muteMonitorGain = null;
 
-    // রিস্যাম্পলিং ও ভয়েস ইফেক্টের জন্য স্টেট
     let resampleCarry = new Float32Array(0);
     let resamplePos = 0;
     let robotPhase = 0;
     let lpState = 0;
     let hpState = 0;
     let prevSample = 0;
+    let gateEnvelope = 0;
+
+    txGainRange.oninput = () => {
+      txGainVal.textContent = `${parseFloat(txGainRange.value).toFixed(1)}x`;
+    };
 
     ws.onopen = () => {
       statusEl.textContent = "স্ট্যাটাস: সার্ভারের সাথে যুক্ত হয়েছে";
@@ -125,9 +144,9 @@
         audioCtx = new (window.AudioContext || window.webkitAudioContext)({
           sampleRate: 16000
         });
-        gainNode = audioCtx.createGain();
-        gainNode.gain.value = 2.2; // অডিও স্পষ্টতার জন্য ভলিউম বুস্ট
-        gainNode.connect(audioCtx.destination);
+        rxGainNode = audioCtx.createGain();
+        rxGainNode.gain.value = 2.0;
+        rxGainNode.connect(audioCtx.destination);
         nextPlayTime = audioCtx.currentTime;
       }
       if (audioCtx.state === "suspended") {
@@ -135,9 +154,9 @@
       }
     }
 
-    // আসা 16-bit PCM অডিও বাজানো (পুরোনো বাফার জমে গেলে লাইভ সময়ে সিঙ্ক করা হয়)
+    // আসা অডিও লাইভ বাজানো (পুরোনো বাফার জমে গেলে সঙ্গে সঙ্গে ড্রপ করে সিঙ্ক রাখা)
     ws.onmessage = async (event) => {
-      if (!audioCtx || audioCtx.state !== "running") return;
+      if (!isListening || !audioCtx || audioCtx.state !== "running") return;
 
       const arrayBuffer = event.data instanceof Blob
         ? await event.data.arrayBuffer()
@@ -156,12 +175,12 @@
 
       const source = audioCtx.createBufferSource();
       source.buffer = audioBuffer;
-      source.connect(gainNode);
+      source.connect(rxGainNode);
 
       const now = audioCtx.currentTime;
-      // ১০-১২ সেকেন্ডের বাফার ল্যাগ আটকাতে 0.25s এর বেশি পিছিয়ে গেলে রিসেট
-      if (nextPlayTime < now || (nextPlayTime - now) > 0.25) {
-        nextPlayTime = now + 0.03;
+      // ল্যাগ 80ms এর বেশি হলে পুরোনো জমে থাকা ডাটা স্কিপ করে লাইভ প্লেব্যাক শুরু
+      if (nextPlayTime < now || (nextPlayTime - now) > 0.08) {
+        nextPlayTime = now + 0.015;
       }
       source.start(nextPlayTime);
       nextPlayTime += audioBuffer.duration;
@@ -169,10 +188,11 @@
 
     listenBtn.onclick = () => {
       ensureAudioContext();
-      statusEl.textContent = "স্ট্যাটাস: Listen চালু আছে (অডিও শোনা যাবে)";
+      isListening = true;
+      nextPlayTime = audioCtx.currentTime + 0.015;
+      statusEl.textContent = "স্ট্যাটাস: লাইভ Listen চালু আছে";
     };
 
-    // পিচ পরিবর্তনের জন্য লিনিয়ার রিস্যাম্পলিং
     function applyPitchShift(samples, ratio) {
       if (Math.abs(ratio - 1.0) < 0.001) {
         return samples;
@@ -205,65 +225,75 @@
       return new Float32Array(out);
     }
 
-    // সিলেক্ট করা ভয়েস মোড অনুযায়ী অডিও প্রসেস করা
-    function applyVoiceEffect(inputSamples, mode) {
-      if (mode === "normal") {
-        return inputSamples;
-      }
+    // নয়েজ গেট + ভয়েস ইফেক্ট + ভলিউম বুস্ট + ক্লিপ সুরক্ষা
+    function processOutgoingAudio(inputSamples, mode, gainBoost) {
+      let samples = inputSamples;
 
       if (mode === "deep") {
-        const shifted = applyPitchShift(inputSamples, 0.78);
+        const shifted = applyPitchShift(samples, 0.78);
         const out = new Float32Array(shifted.length);
         for (let i = 0; i < shifted.length; i++) {
           lpState = lpState + 0.35 * (shifted[i] - lpState);
           out[i] = lpState * 1.15;
         }
-        return out;
-      }
-
-      if (mode === "high") {
-        const shifted = applyPitchShift(inputSamples, 1.32);
+        samples = out;
+      } else if (mode === "high") {
+        const shifted = applyPitchShift(samples, 1.32);
         const out = new Float32Array(shifted.length);
         for (let i = 0; i < shifted.length; i++) {
-          out[i] = shifted[i] * 1.05;
+          out[i] = shifted[i] * 1.08;
         }
-        return out;
-      }
-
-      if (mode === "robot") {
-        const out = new Float32Array(inputSamples.length);
+        samples = out;
+      } else if (mode === "robot") {
+        const out = new Float32Array(samples.length);
         const carrierFreq = 95;
         const step = (2 * Math.PI * carrierFreq) / 16000;
-        for (let i = 0; i < inputSamples.length; i++) {
+        for (let i = 0; i < samples.length; i++) {
           const mod = Math.sin(robotPhase);
           robotPhase += step;
           if (robotPhase > 2 * Math.PI) robotPhase -= 2 * Math.PI;
-          out[i] = inputSamples[i] * (0.45 + 0.55 * mod) * 1.2;
+          out[i] = samples[i] * (0.45 + 0.55 * mod) * 1.2;
         }
-        return out;
-      }
-
-      if (mode === "walkie") {
-        const out = new Float32Array(inputSamples.length);
-        for (let i = 0; i < inputSamples.length; i++) {
-          const x = inputSamples[i];
+        samples = out;
+      } else if (mode === "walkie") {
+        const out = new Float32Array(samples.length);
+        for (let i = 0; i < samples.length; i++) {
+          const x = samples[i];
           const hp = 0.85 * (hpState + x - prevSample);
           hpState = hp;
           prevSample = x;
-
           lpState = lpState + 0.28 * (hp - lpState);
           const clipped = Math.max(-0.55, Math.min(0.55, lpState * 1.8));
           out[i] = clipped * 1.35;
         }
-        return out;
+        samples = out;
       }
 
-      return inputSamples;
+      // হালকা নয়েজ গেট (চুপ থাকলে ব্যাকগ্রাউন্ড হিস/নয়েজ ব্লক রাখা) ও ভলিউম বুস্ট
+      const finalOut = new Float32Array(samples.length);
+      const noiseThreshold = 0.018;
+
+      for (let i = 0; i < samples.length; i++) {
+        const raw = samples[i];
+        const absVal = Math.abs(raw);
+        const targetGate = absVal > noiseThreshold ? 1.0 : 0.05;
+        gateEnvelope += (targetGate - gateEnvelope) * 0.08;
+
+        // সফট-ক্লিপ সুরক্ষা (বিকৃত শব্দ বা ব্লক ঠেকাতে)
+        let boosted = raw * gateEnvelope * gainBoost;
+        boosted = Math.tanh(boosted);
+        finalOut[i] = boosted;
+      }
+
+      return finalOut;
     }
 
     async function startTalking() {
       if (isTalking) return;
       ensureAudioContext();
+
+      // কথা বলার সময় রিপিট/লুপ ঠেকাতে Listen অটো পজ করা
+      isListening = false;
 
       resampleCarry = new Float32Array(0);
       resamplePos = 0;
@@ -271,6 +301,7 @@
       lpState = 0;
       hpState = 0;
       prevSample = 0;
+      gateEnvelope = 0;
 
       try {
         micStream = await navigator.mediaDevices.getUserMedia({
@@ -278,17 +309,24 @@
             channelCount: 1,
             sampleRate: 16000,
             echoCancellation: true,
-            noiseSuppression: true
+            noiseSuppression: true,
+            autoGainControl: true
           }
         });
 
         micSource = audioCtx.createMediaStreamSource(micStream);
-        processor = audioCtx.createScriptProcessor(2048, 1, 1);
+        // কম লেটেন্সির জন্য 1024 বাফার
+        processor = audioCtx.createScriptProcessor(1024, 1, 1);
+
+        // নিজের ডিভাইসে মাইক্রোফোনের শব্দ লুপ হওয়া বন্ধ রাখতে 0 gain দিয়ে কানেক্ট
+        muteMonitorGain = audioCtx.createGain();
+        muteMonitorGain.gain.value = 0;
 
         processor.onaudioprocess = (e) => {
           if (!isTalking || ws.readyState !== WebSocket.OPEN) return;
           const input = e.inputBuffer.getChannelData(0);
-          const processed = applyVoiceEffect(input, voiceSelect.value);
+          const boost = parseFloat(txGainRange.value) || 3.2;
+          const processed = processOutgoingAudio(input, voiceSelect.value, boost);
 
           const pcm16 = new Int16Array(processed.length);
           for (let i = 0; i < processed.length; i++) {
@@ -299,11 +337,12 @@
         };
 
         micSource.connect(processor);
-        processor.connect(audioCtx.destination);
+        processor.connect(muteMonitorGain);
+        muteMonitorGain.connect(audioCtx.destination);
 
         isTalking = true;
         talkBtn.textContent = "Stop Talking (বন্ধ করুন)";
-        statusEl.textContent = `স্ট্যাটাস: Talk চালু আছে (${voiceSelect.options[voiceSelect.selectedIndex].text})`;
+        statusEl.textContent = `স্ট্যাটাস: লাইভ Talk চালু (${voiceSelect.options[voiceSelect.selectedIndex].text})`;
       } catch (err) {
         statusEl.textContent = "মাইক্রোফোন অনুমতি পাওয়া যায়নি: " + err.message;
       }
@@ -315,6 +354,10 @@
         processor.disconnect();
         processor = null;
       }
+      if (muteMonitorGain) {
+        muteMonitorGain.disconnect();
+        muteMonitorGain = null;
+      }
       if (micSource) {
         micSource.disconnect();
         micSource = null;
@@ -324,12 +367,12 @@
         micStream = null;
       }
       talkBtn.textContent = "Talk (কথা বলুন)";
-      statusEl.textContent = "স্ট্যাটাস: Talk বন্ধ করা হয়েছে";
+      statusEl.textContent = "স্ট্যাটাস: Talk বন্ধ হয়েছে (শুনতে Listen চাপুন)";
     }
 
     voiceSelect.onchange = () => {
       if (isTalking) {
-        statusEl.textContent = `স্ট্যাটাস: Talk চালু আছে (${voiceSelect.options[voiceSelect.selectedIndex].text})`;
+        statusEl.textContent = `স্ট্যাটাস: লাইভ Talk চালু (${voiceSelect.options[voiceSelect.selectedIndex].text})`;
       }
     };
 

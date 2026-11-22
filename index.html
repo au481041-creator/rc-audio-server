@@ -42,10 +42,18 @@
       font-size: 14px;
       color: #bbdefb;
     }
-    input[type="range"] {
+    select, input[type="range"] {
       width: 100%;
       margin-top: 4px;
       cursor: pointer;
+    }
+    select {
+      padding: 10px 12px;
+      font-size: 15px;
+      border-radius: 6px;
+      border: none;
+      background: #2c2c2c;
+      color: #fff;
     }
     #status {
       margin-top: 20px;
@@ -61,8 +69,19 @@
   <button id="talkBtn">Talk (কথা বলুন)</button>
 
   <div class="control-box">
-    <label for="txGainRange">স্পিকার ভলিউম বুস্ট (পাঠানো ভয়েস): <span id="txGainVal">1.2x</span></label>
-    <input id="txGainRange" type="range" min="0.6" max="3.0" step="0.1" value="1.2" />
+    <label for="voiceSelect">ভয়েস মোড বেছে নিন:</label>
+    <select id="voiceSelect">
+      <option value="normal" selected>Normal (স্বাভাবিক)</option>
+      <option value="cartoon">Cartoon (কার্টুন ভয়েস)</option>
+      <option value="kid">Kid (বাচ্চাদের ভয়েস)</option>
+      <option value="robot">Robot (রোবোটিক ভয়েস)</option>
+      <option value="deep">Deep (গম্ভীর কণ্ঠ)</option>
+    </select>
+  </div>
+
+  <div class="control-box">
+    <label for="txGainRange">স্পিকার ভলিউম বুস্ট (পাঠানো ভয়েস): <span id="txGainVal">2.2x</span></label>
+    <input id="txGainRange" type="range" min="0.8" max="4.0" step="0.1" value="2.2" />
   </div>
 
   <div id="status">স্ট্যাটাস: সংযোগ হচ্ছে...</div>
@@ -74,6 +93,7 @@
     const statusEl = document.getElementById("status");
     const listenBtn = document.getElementById("listenBtn");
     const talkBtn = document.getElementById("talkBtn");
+    const voiceSelect = document.getElementById("voiceSelect");
     const txGainRange = document.getElementById("txGainRange");
     const txGainVal = document.getElementById("txGainVal");
 
@@ -87,10 +107,16 @@
     let micSource = null;
     let muteMonitorGain = null;
 
+    let resampleCarry = new Float32Array(0);
+    let resamplePos = 0.0;
     let txResamplePos = 0.0;
+    let robotPhase = 0.0;
+    let cartoonPhase = 0.0;
+    let lpState = 0.0;
     let hpState = 0.0;
     let prevSample = 0.0;
     let gateGain = 0.0;
+    let lastMode = "normal";
 
     function connectWS() {
       ws = new WebSocket(`${protocol}//${location.host}`);
@@ -142,7 +168,8 @@
       if (!audioCtx) {
         audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         rxGainNode = audioCtx.createGain();
-        rxGainNode.gain.value = 2.0;
+        // ল্যাপটপে গাড়ির মাইকের সাউন্ড স্পষ্ট ও জোরে শুনতে
+        rxGainNode.gain.value = 2.6;
         rxGainNode.connect(audioCtx.destination);
         nextPlayTime = audioCtx.currentTime;
       }
@@ -152,7 +179,12 @@
     }
 
     function resetDspState() {
+      resampleCarry = new Float32Array(0);
+      resamplePos = 0.0;
       txResamplePos = 0.0;
+      robotPhase = 0.0;
+      cartoonPhase = 0.0;
+      lpState = 0.0;
       hpState = 0.0;
       prevSample = 0.0;
       gateGain = 0.0;
@@ -178,6 +210,34 @@
       return out;
     }
 
+    function applySmoothPitch(samples, ratio) {
+      if (Math.abs(ratio - 1.0) < 0.001) return samples;
+      const combined = new Float32Array(resampleCarry.length + samples.length);
+      combined.set(resampleCarry, 0);
+      combined.set(samples, resampleCarry.length);
+
+      const maxSteps = Math.max(0, Math.floor((combined.length - 2 - resamplePos) / ratio));
+      const out = new Float32Array(maxSteps);
+
+      let pos = resamplePos;
+      for (let i = 0; i < maxSteps; i++) {
+        const idx = Math.floor(pos);
+        const frac = pos - idx;
+        out[i] = combined[idx] * (1.0 - frac) + combined[idx + 1] * frac;
+        pos += ratio;
+      }
+
+      const consumed = Math.floor(pos);
+      if (consumed < combined.length) {
+        resampleCarry = combined.slice(consumed);
+        resamplePos = pos - consumed;
+      } else {
+        resampleCarry = new Float32Array(0);
+        resamplePos = 0.0;
+      }
+      return out;
+    }
+
     listenBtn.onclick = async () => {
       await ensureAudioContext();
       isListening = true;
@@ -185,7 +245,13 @@
       statusEl.textContent = "স্ট্যাটাস: লাইভ Listen চালু আছে";
     };
 
-    function processOutgoingAudio(inputSamples, gainBoost) {
+    function processOutgoingAudio(inputSamples, mode, gainBoost) {
+      if (mode !== lastMode) {
+        resampleCarry = new Float32Array(0);
+        resamplePos = 0.0;
+        lastMode = mode;
+      }
+
       const cleanIn = new Float32Array(inputSamples.length);
       for (let i = 0; i < inputSamples.length; i++) {
         const x = inputSamples[i];
@@ -196,8 +262,8 @@
       }
 
       const gated = new Float32Array(cleanIn.length);
-      const openThreshold = 0.045;
-      const closeThreshold = 0.022;
+      const openThreshold = 0.038;
+      const closeThreshold = 0.018;
 
       for (let i = 0; i < cleanIn.length; i++) {
         const amp = Math.abs(cleanIn[i]);
@@ -205,16 +271,62 @@
         if (amp > openThreshold) desiredGate = 1.0;
         else if (amp < closeThreshold) desiredGate = 0.0;
 
-        const coeff = desiredGate > gateGain ? 0.25 : 0.20;
+        const coeff = desiredGate > gateGain ? 0.30 : 0.18;
         gateGain += (desiredGate - gateGain) * coeff;
-
-        let val = cleanIn[i] * gateGain * gainBoost;
-        if (val > 0.85) val = 0.85;
-        if (val < -0.85) val = -0.85;
-        gated[i] = val;
+        gated[i] = cleanIn[i] * gateGain;
       }
 
-      return gated;
+      let effectOut = gated;
+
+      if (mode === "cartoon") {
+        // কার্টুন ভয়েস: উঁচু পিচ + হালকা মজার ফ্রিকোয়েন্সি ওয়েবলি
+        const shifted = applySmoothPitch(gated, 1.38);
+        effectOut = new Float32Array(shifted.length);
+        const step = (2.0 * Math.PI * 7.0) / 16000;
+        for (let i = 0; i < shifted.length; i++) {
+          const wobble = 0.88 + 0.12 * Math.sin(cartoonPhase);
+          cartoonPhase += step;
+          if (cartoonPhase > 2.0 * Math.PI) cartoonPhase -= 2.0 * Math.PI;
+          effectOut[i] = shifted[i] * wobble * 1.12;
+        }
+      } else if (mode === "kid") {
+        // বাচ্চাদের ভয়েস: স্বাভাবিক-উঁচু পিচ, পরিষ্কার ও নরম
+        const shifted = applySmoothPitch(gated, 1.24);
+        effectOut = new Float32Array(shifted.length);
+        for (let i = 0; i < shifted.length; i++) {
+          effectOut[i] = shifted[i] * 1.08;
+        }
+      } else if (mode === "robot") {
+        // রোবোটিক ভয়েস: রিং মডুলেশন + হালকা কৌণিক শার্পনেস
+        effectOut = new Float32Array(gated.length);
+        const carrierFreq = 85;
+        const step = (2.0 * Math.PI * carrierFreq) / 16000;
+        for (let i = 0; i < gated.length; i++) {
+          const mod = Math.sin(robotPhase);
+          robotPhase += step;
+          if (robotPhase > 2.0 * Math.PI) robotPhase -= 2.0 * Math.PI;
+          const mixed = gated[i] * (0.55 + 0.45 * mod) * 1.15;
+          effectOut[i] = Math.max(-0.85, Math.min(0.85, mixed));
+        }
+      } else if (mode === "deep") {
+        // গম্ভীর কণ্ঠ
+        const shifted = applySmoothPitch(gated, 0.84);
+        effectOut = new Float32Array(shifted.length);
+        for (let i = 0; i < shifted.length; i++) {
+          lpState = lpState + 0.55 * (shifted[i] - lpState);
+          effectOut[i] = lpState * 1.12;
+        }
+      }
+
+      const finalOut = new Float32Array(effectOut.length);
+      for (let i = 0; i < effectOut.length; i++) {
+        let v = effectOut[i] * gainBoost;
+        if (v > 0.92) v = 0.92;
+        if (v < -0.92) v = -0.92;
+        finalOut[i] = v;
+      }
+
+      return finalOut;
     }
 
     async function startTalking() {
@@ -227,6 +339,7 @@
       }
 
       resetDspState();
+      lastMode = voiceSelect.value;
 
       try {
         micStream = await navigator.mediaDevices.getUserMedia({
@@ -248,8 +361,8 @@
           if (!isTalking || !ws || ws.readyState !== WebSocket.OPEN) return;
           const rawInput = e.inputBuffer.getChannelData(0);
           const input16k = resampleTo16k(rawInput, audioCtx.sampleRate);
-          const boost = parseFloat(txGainRange.value) || 1.2;
-          const processed = processOutgoingAudio(input16k, boost);
+          const boost = parseFloat(txGainRange.value) || 2.2;
+          const processed = processOutgoingAudio(input16k, voiceSelect.value, boost);
 
           const pcm16 = new Int16Array(processed.length);
           for (let i = 0; i < processed.length; i++) {
@@ -268,7 +381,7 @@
 
         isTalking = true;
         talkBtn.textContent = "Stop Talking (বন্ধ করুন)";
-        statusEl.textContent = "স্ট্যাটাস: লাইভ Talk চালু";
+        statusEl.textContent = `স্ট্যাটাস: লাইভ Talk চালু (${voiceSelect.options[voiceSelect.selectedIndex].text})`;
       } catch (err) {
         statusEl.textContent = "মাইক্রোফোন অনুমতি পাওয়া যায়নি: " + err.message;
       }
@@ -284,6 +397,12 @@
       talkBtn.textContent = "Talk (কথা বলুন)";
       statusEl.textContent = "স্ট্যাটাস: Talk বন্ধ হয়েছে";
     }
+
+    voiceSelect.onchange = () => {
+      if (isTalking) {
+        statusEl.textContent = `স্ট্যাটাস: লাইভ Talk চালু (${voiceSelect.options[voiceSelect.selectedIndex].text})`;
+      }
+    };
 
     talkBtn.onclick = () => {
       if (!isTalking) startTalking();

@@ -42,18 +42,10 @@
       font-size: 14px;
       color: #bbdefb;
     }
-    select, input[type="range"] {
+    input[type="range"] {
       width: 100%;
       margin-top: 4px;
       cursor: pointer;
-    }
-    select {
-      padding: 10px 12px;
-      font-size: 15px;
-      border-radius: 6px;
-      border: none;
-      background: #2c2c2c;
-      color: #fff;
     }
     #status {
       margin-top: 20px;
@@ -69,19 +61,8 @@
   <button id="talkBtn">Talk (কথা বলুন)</button>
 
   <div class="control-box">
-    <label for="voiceSelect">ভয়েস মোড বেছে নিন:</label>
-    <select id="voiceSelect">
-      <option value="normal" selected>Normal (স্বাভাবিক)</option>
-      <option value="cartoon">Cartoon (কার্টুন ভয়েস)</option>
-      <option value="kid">Kid (বাচ্চাদের ভয়েস)</option>
-      <option value="robot">Robot (রোবোটিক ভয়েস)</option>
-      <option value="deep">Deep (গম্ভীর কণ্ঠ)</option>
-    </select>
-  </div>
-
-  <div class="control-box">
-    <label for="txGainRange">স্পিকার ভলিউম বুস্ট (পাঠানো ভয়েস): <span id="txGainVal">1.8x</span></label>
-    <input id="txGainRange" type="range" min="1.0" max="2.5" step="0.1" value="1.8" />
+    <label for="txGainRange">স্পিকার ভলিউম বুস্ট (পাঠানো ভয়েস): <span id="txGainVal">1.6x</span></label>
+    <input id="txGainRange" type="range" min="1.0" max="2.4" step="0.1" value="1.6" />
   </div>
 
   <div id="status">স্ট্যাটাস: সংযোগ হচ্ছে...</div>
@@ -93,7 +74,6 @@
     const statusEl = document.getElementById("status");
     const listenBtn = document.getElementById("listenBtn");
     const talkBtn = document.getElementById("talkBtn");
-    const voiceSelect = document.getElementById("voiceSelect");
     const txGainRange = document.getElementById("txGainRange");
     const txGainVal = document.getElementById("txGainVal");
 
@@ -108,12 +88,8 @@
     let muteMonitorGain = null;
 
     let txResamplePos = 0.0;
-    let robotPhase = 0.0;
-    let lpState = 0.0;
     let hpState = 0.0;
     let prevSample = 0.0;
-    let prevHpSample = 0.0;
-    let gateGain = 0.0;
 
     function connectWS() {
       ws = new WebSocket(`${protocol}//${location.host}`);
@@ -176,12 +152,8 @@
 
     function resetDspState() {
       txResamplePos = 0.0;
-      robotPhase = 0.0;
-      lpState = 0.0;
       hpState = 0.0;
       prevSample = 0.0;
-      prevHpSample = 0.0;
-      gateGain = 0.0;
     }
 
     function resampleTo16k(samples, inputRate) {
@@ -211,56 +183,32 @@
       statusEl.textContent = "স্ট্যাটাস: লাইভ Listen চালু আছে";
     };
 
-    // ভিড়ের মাঝে ভয়েস স্পষ্ট রাখতে প্রেজেন্স বুস্ট + ঘেরঘেরমুক্ত নয়েজ গেট
-    function processOutgoingAudio(inputSamples, mode, gainBoost) {
-      const out = new Float32Array(inputSamples.length);
-      const openThreshold = 0.035;
-      const closeThreshold = 0.017;
-      const robotStep = (2.0 * Math.PI * 130) / 16000;
+    // পুরো বাফারের পিক দেখে কথা থামার সাথে সাথে একদম 0 করে দেয় যাতে ঘেরঘের না থাকে
+    function processOutgoingAudio(inputSamples, gainBoost) {
+      const filtered = new Float32Array(inputSamples.length);
+      let peak = 0.0;
 
       for (let i = 0; i < inputSamples.length; i++) {
         const x = inputSamples[i];
-
-        // ১. হাই-পাস ফিল্টার (নিচু ফ্রিকোয়েন্সির গুঞ্জন ও ঘেরঘের কমাতে)
-        const hp = 0.978 * (hpState + x - prevSample);
+        const hp = 0.985 * (hpState + x - prevSample);
         hpState = hp;
         prevSample = x;
-
-        // ২. নয়েজ গেট
-        const amp = Math.abs(hp);
-        let desiredGate = gateGain;
-        if (amp > openThreshold) desiredGate = 1.0;
-        else if (amp < closeThreshold) desiredGate = 0.0;
-
-        const coeff = desiredGate > gateGain ? 0.32 : 0.18;
-        gateGain += (desiredGate - gateGain) * coeff;
-
-        let s = hp * gateGain;
-
-        // ৩. ভিড়ের মাঝে কথা স্পষ্ট করার জন্য ভয়েস প্রেজেন্স (হালকা শার্পনেস)
-        const diff = s - prevHpSample;
-        prevHpSample = s;
-        s = s + 0.35 * diff;
-
-        // ৪. ভয়েস মোডগুলো
-        if (mode === "cartoon") {
-          s = (s + 0.45 * diff) * 1.15;
-        } else if (mode === "kid") {
-          s = (s + 0.25 * diff) * 1.10;
-        } else if (mode === "robot") {
-          const mod = Math.sin(robotPhase);
-          robotPhase += robotStep;
-          if (robotPhase > 2.0 * Math.PI) robotPhase -= 2.0 * Math.PI;
-          s = s * (0.82 + 0.18 * mod) * 1.12;
-        } else if (mode === "deep") {
-          lpState = lpState + 0.50 * (s - lpState);
-          s = (lpState + 0.20 * diff) * 1.15;
-        }
-
-        // ৫. সফট লিমিটিং দিয়ে জোরালো ও ঘেরঘেরমুক্ত আউটপুট
-        out[i] = Math.tanh(s * gainBoost * 1.25) * 0.90;
+        filtered[i] = hp;
+        const a = Math.abs(hp);
+        if (a > peak) peak = a;
       }
 
+      if (peak < 0.032) {
+        return new Float32Array(inputSamples.length);
+      }
+
+      const out = new Float32Array(inputSamples.length);
+      for (let i = 0; i < inputSamples.length; i++) {
+        let v = filtered[i] * gainBoost * 1.25;
+        if (v > 0.78) v = 0.78;
+        if (v < -0.78) v = -0.78;
+        out[i] = v;
+      }
       return out;
     }
 
@@ -295,8 +243,8 @@
           if (!isTalking || !ws || ws.readyState !== WebSocket.OPEN) return;
           const rawInput = e.inputBuffer.getChannelData(0);
           const input16k = resampleTo16k(rawInput, audioCtx.sampleRate);
-          const boost = parseFloat(txGainRange.value) || 1.8;
-          const processed = processOutgoingAudio(input16k, voiceSelect.value, boost);
+          const boost = parseFloat(txGainRange.value) || 1.6;
+          const processed = processOutgoingAudio(input16k, boost);
 
           const pcm16 = new Int16Array(processed.length);
           for (let i = 0; i < processed.length; i++) {
@@ -315,7 +263,7 @@
 
         isTalking = true;
         talkBtn.textContent = "Stop Talking (বন্ধ করুন)";
-        statusEl.textContent = `স্ট্যাটাস: লাইভ Talk চালু (${voiceSelect.options[voiceSelect.selectedIndex].text})`;
+        statusEl.textContent = "স্ট্যাটাস: লাইভ Talk চালু";
       } catch (err) {
         statusEl.textContent = "মাইক্রোফোন অনুমতি পাওয়া যায়নি: " + err.message;
       }
@@ -331,12 +279,6 @@
       talkBtn.textContent = "Talk (কথা বলুন)";
       statusEl.textContent = "স্ট্যাটাস: Talk বন্ধ হয়েছে";
     }
-
-    voiceSelect.onchange = () => {
-      if (isTalking) {
-        statusEl.textContent = `স্ট্যাটাস: লাইভ Talk চালু (${voiceSelect.options[voiceSelect.selectedIndex].text})`;
-      }
-    };
 
     talkBtn.onclick = () => {
       if (!isTalking) startTalking();

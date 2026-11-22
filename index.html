@@ -42,18 +42,10 @@
       font-size: 14px;
       color: #bbdefb;
     }
-    select, input[type="range"] {
+    input[type="range"] {
       width: 100%;
       margin-top: 4px;
       cursor: pointer;
-    }
-    select {
-      padding: 10px 12px;
-      font-size: 15px;
-      border-radius: 6px;
-      border: none;
-      background: #2c2c2c;
-      color: #fff;
     }
     #status {
       margin-top: 20px;
@@ -69,19 +61,8 @@
   <button id="talkBtn">Talk (কথা বলুন)</button>
 
   <div class="control-box">
-    <label for="voiceSelect">ভয়েস মোড বেছে নিন:</label>
-    <select id="voiceSelect">
-      <option value="normal" selected>Normal (স্বাভাবিক)</option>
-      <option value="deep">Deep / গম্ভীর কণ্ঠ</option>
-      <option value="high">High / চিকন কণ্ঠ</option>
-      <option value="robot">Robot / রোবট ভয়েস</option>
-      <option value="walkie">Walkie-Talkie / ওয়াকিটকি</option>
-    </select>
-  </div>
-
-  <div class="control-box">
-    <label for="txGainRange">স্পিকার ভলিউম বুস্ট (পাঠানো ভয়েস): <span id="txGainVal">1.5x</span></label>
-    <input id="txGainRange" type="range" min="1.0" max="4.0" step="0.1" value="1.5" />
+    <label for="txGainRange">স্পিকার ভলিউম বুস্ট (পাঠানো ভয়েস): <span id="txGainVal">1.2x</span></label>
+    <input id="txGainRange" type="range" min="0.6" max="3.0" step="0.1" value="1.2" />
   </div>
 
   <div id="status">স্ট্যাটাস: সংযোগ হচ্ছে...</div>
@@ -93,7 +74,6 @@
     const statusEl = document.getElementById("status");
     const listenBtn = document.getElementById("listenBtn");
     const talkBtn = document.getElementById("talkBtn");
-    const voiceSelect = document.getElementById("voiceSelect");
     const txGainRange = document.getElementById("txGainRange");
     const txGainVal = document.getElementById("txGainVal");
 
@@ -209,15 +189,15 @@
       const cleanIn = new Float32Array(inputSamples.length);
       for (let i = 0; i < inputSamples.length; i++) {
         const x = inputSamples[i];
-        const hp = 0.975 * (hpState + x - prevSample);
+        const hp = 0.98 * (hpState + x - prevSample);
         hpState = hp;
         prevSample = x;
         cleanIn[i] = hp;
       }
 
       const gated = new Float32Array(cleanIn.length);
-      const openThreshold = 0.030;
-      const closeThreshold = 0.015;
+      const openThreshold = 0.045;
+      const closeThreshold = 0.022;
 
       for (let i = 0; i < cleanIn.length; i++) {
         const amp = Math.abs(cleanIn[i]);
@@ -225,11 +205,13 @@
         if (amp > openThreshold) desiredGate = 1.0;
         else if (amp < closeThreshold) desiredGate = 0.0;
 
-        const coeff = desiredGate > gateGain ? 0.30 : 0.15;
+        const coeff = desiredGate > gateGain ? 0.25 : 0.20;
         gateGain += (desiredGate - gateGain) * coeff;
-        gated[i] = cleanIn[i] * gateGain * gainBoost;
-        if (gated[i] > 0.9) gated[i] = 0.9;
-        if (gated[i] < -0.9) gated[i] = -0.9;
+
+        let val = cleanIn[i] * gateGain * gainBoost;
+        if (val > 0.85) val = 0.85;
+        if (val < -0.85) val = -0.85;
+        gated[i] = val;
       }
 
       return gated;
@@ -257,7 +239,7 @@
         });
 
         micSource = audioCtx.createMediaStreamSource(micStream);
-        processor = audioCtx.createScriptProcessor(2048, 1, 1);
+        processor = audioCtx.createScriptProcessor(4096, 1, 1);
 
         muteMonitorGain = audioCtx.createGain();
         muteMonitorGain.gain.value = 0;
@@ -266,7 +248,7 @@
           if (!isTalking || !ws || ws.readyState !== WebSocket.OPEN) return;
           const rawInput = e.inputBuffer.getChannelData(0);
           const input16k = resampleTo16k(rawInput, audioCtx.sampleRate);
-          const boost = parseFloat(txGainRange.value) || 1.5;
+          const boost = parseFloat(txGainRange.value) || 1.2;
           const processed = processOutgoingAudio(input16k, boost);
 
           const pcm16 = new Int16Array(processed.length);

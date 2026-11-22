@@ -88,13 +88,13 @@
   </div>
 
   <div class="control-box">
-    <label for="txGainRange">স্পিকার ভলিউম বুস্ট (পাঠানো ভয়েস): <span id="txGainVal">3.2x</span></label>
-    <input id="txGainRange" type="range" min="1.0" max="6.0" step="0.2" value="3.2" />
+    <label for="txGainRange">স্পিকার ভলিউম বুস্ট (পাঠানো ভয়েস): <span id="txGainVal">3.0x</span></label>
+    <input id="txGainRange" type="range" min="1.0" max="6.0" step="0.2" value="3.0" />
   </div>
 
   <div id="status">স্ট্যাটাস: সংযোগ হচ্ছে...</div>
   <div class="note">
-    সুরক্ষা ও দ্রুত সাউন্ডের জন্য: ০.০৮ সেকেন্ডের বেশি পুরোনো অডিও বাফার স্বয়ংক্রিয়ভাবে বাদ দেওয়া হবে। কথা বলার সময় একসাথে Listen চালু না রাখলে রিপিট হবে না।
+    নয়েজ কমাতে কথা না বললে নয়েজ গেট স্বয়ংক্রিয়ভাবে আওয়াজ আটকায় এবং ০.০৮ সেকেন্ডের বেশি পুরোনো বাফার স্কিপ করে লাইভ সাউন্ড রাখে।
   </div>
 
   <script>
@@ -119,13 +119,15 @@
     let micSource = null;
     let muteMonitorGain = null;
 
+    // ডিএসপি স্টেটসমূহ
     let resampleCarry = new Float32Array(0);
-    let resamplePos = 0;
-    let robotPhase = 0;
-    let lpState = 0;
-    let hpState = 0;
-    let prevSample = 0;
-    let gateEnvelope = 0;
+    let resamplePos = 0.0;
+    let robotPhase = 0.0;
+    let lpState = 0.0;
+    let hpState = 0.0;
+    let prevSample = 0.0;
+    let gateGain = 0.0;
+    let lastMode = "normal";
 
     txGainRange.oninput = () => {
       txGainVal.textContent = `${parseFloat(txGainRange.value).toFixed(1)}x`;
@@ -154,7 +156,17 @@
       }
     }
 
-    // আসা অডিও লাইভ বাজানো (পুরোনো বাফার জমে গেলে সঙ্গে সঙ্গে ড্রপ করে সিঙ্ক রাখা)
+    function resetDspState() {
+      resampleCarry = new Float32Array(0);
+      resamplePos = 0.0;
+      robotPhase = 0.0;
+      lpState = 0.0;
+      hpState = 0.0;
+      prevSample = 0.0;
+      gateGain = 0.0;
+    }
+
+    // আসা অডিও লাইভ বাজানো
     ws.onmessage = async (event) => {
       if (!isListening || !audioCtx || audioCtx.state !== "running") return;
 
@@ -178,7 +190,6 @@
       source.connect(rxGainNode);
 
       const now = audioCtx.currentTime;
-      // ল্যাগ 80ms এর বেশি হলে পুরোনো জমে থাকা ডাটা স্কিপ করে লাইভ প্লেব্যাক শুরু
       if (nextPlayTime < now || (nextPlayTime - now) > 0.08) {
         nextPlayTime = now + 0.015;
       }
@@ -193,7 +204,8 @@
       statusEl.textContent = "স্ট্যাটাস: লাইভ Listen চালু আছে";
     };
 
-    function applyPitchShift(samples, ratio) {
+    // স্মুথ ও কাটাহীন পিচ শিফট (চিকন/গম্ভীর কণ্ঠের জন্য)
+    function applySmoothPitch(samples, ratio) {
       if (Math.abs(ratio - 1.0) < 0.001) {
         return samples;
       }
@@ -202,14 +214,14 @@
       combined.set(resampleCarry, 0);
       combined.set(samples, resampleCarry.length);
 
-      const out = [];
-      let pos = resamplePos;
+      const maxSteps = Math.max(0, Math.floor((combined.length - 2 - resamplePos) / ratio));
+      const out = new Float32Array(maxSteps);
 
-      while (pos + 1 < combined.length) {
+      let pos = resamplePos;
+      for (let i = 0; i < maxSteps; i++) {
         const idx = Math.floor(pos);
         const frac = pos - idx;
-        const val = combined[idx] * (1 - frac) + combined[idx + 1] * frac;
-        out.push(val);
+        out[i] = combined[idx] * (1.0 - frac) + combined[idx + 1] * frac;
         pos += ratio;
       }
 
@@ -219,70 +231,96 @@
         resamplePos = pos - consumed;
       } else {
         resampleCarry = new Float32Array(0);
-        resamplePos = 0;
+        resamplePos = 0.0;
       }
 
-      return new Float32Array(out);
+      return out;
     }
 
-    // নয়েজ গেট + ভয়েস ইফেক্ট + ভলিউম বুস্ট + ক্লিপ সুরক্ষা
+    // নয়েজ কমানো + ভয়েস ইফেক্ট + ভলিউম বুস্ট
     function processOutgoingAudio(inputSamples, mode, gainBoost) {
-      let samples = inputSamples;
-
-      if (mode === "deep") {
-        const shifted = applyPitchShift(samples, 0.78);
-        const out = new Float32Array(shifted.length);
-        for (let i = 0; i < shifted.length; i++) {
-          lpState = lpState + 0.35 * (shifted[i] - lpState);
-          out[i] = lpState * 1.15;
-        }
-        samples = out;
-      } else if (mode === "high") {
-        const shifted = applyPitchShift(samples, 1.32);
-        const out = new Float32Array(shifted.length);
-        for (let i = 0; i < shifted.length; i++) {
-          out[i] = shifted[i] * 1.08;
-        }
-        samples = out;
-      } else if (mode === "robot") {
-        const out = new Float32Array(samples.length);
-        const carrierFreq = 95;
-        const step = (2 * Math.PI * carrierFreq) / 16000;
-        for (let i = 0; i < samples.length; i++) {
-          const mod = Math.sin(robotPhase);
-          robotPhase += step;
-          if (robotPhase > 2 * Math.PI) robotPhase -= 2 * Math.PI;
-          out[i] = samples[i] * (0.45 + 0.55 * mod) * 1.2;
-        }
-        samples = out;
-      } else if (mode === "walkie") {
-        const out = new Float32Array(samples.length);
-        for (let i = 0; i < samples.length; i++) {
-          const x = samples[i];
-          const hp = 0.85 * (hpState + x - prevSample);
-          hpState = hp;
-          prevSample = x;
-          lpState = lpState + 0.28 * (hp - lpState);
-          const clipped = Math.max(-0.55, Math.min(0.55, lpState * 1.8));
-          out[i] = clipped * 1.35;
-        }
-        samples = out;
+      if (mode !== lastMode) {
+        resampleCarry = new Float32Array(0);
+        resamplePos = 0.0;
+        lastMode = mode;
       }
 
-      // হালকা নয়েজ গেট (চুপ থাকলে ব্যাকগ্রাউন্ড হিস/নয়েজ ব্লক রাখা) ও ভলিউম বুস্ট
-      const finalOut = new Float32Array(samples.length);
-      const noiseThreshold = 0.018;
+      // ১. মাইক্রোফোনের ইনপুট থেকে হালকা হাই-পাস দিয়ে নিচের ঘড়ঘড় নয়েজ কমানো
+      const cleanIn = new Float32Array(inputSamples.length);
+      for (let i = 0; i < inputSamples.length; i++) {
+        const x = inputSamples[i];
+        const hp = 0.92 * (hpState + x - prevSample);
+        hpState = hp;
+        prevSample = x;
+        cleanIn[i] = hp;
+      }
 
-      for (let i = 0; i < samples.length; i++) {
-        const raw = samples[i];
-        const absVal = Math.abs(raw);
-        const targetGate = absVal > noiseThreshold ? 1.0 : 0.05;
-        gateEnvelope += (targetGate - gateEnvelope) * 0.08;
+      // ২. স্মার্ট নয়েজ গেট (নয়েজ টেনে নেওয়া বন্ধ রাখতে)
+      const gated = new Float32Array(cleanIn.length);
+      const openThreshold = 0.028;
+      const closeThreshold = 0.015;
 
-        // সফট-ক্লিপ সুরক্ষা (বিকৃত শব্দ বা ব্লক ঠেকাতে)
-        let boosted = raw * gateEnvelope * gainBoost;
-        boosted = Math.tanh(boosted);
-        finalOut[i] = boosted;
+      for (let i = 0; i < cleanIn.length; i++) {
+        const amp = Math.abs(cleanIn[i]);
+        let desiredGate = gateGain;
+
+        if (amp > openThreshold) {
+          desiredGate = 1.0;
+        } else if (amp < closeThreshold) {
+          desiredGate = 0.0;
+        }
+
+        // কথা শুরু হলে দ্রুত খুলবে, চুপ হলে দ্রুত বন্ধ হবে
+        const coeff = desiredGate > gateGain ? 0.35 : 0.14;
+        gateGain += (desiredGate - gateGain) * coeff;
+
+        gated[i] = cleanIn[i] * gateGain;
+      }
+
+      // ৩. ভয়েস ইফেক্ট প্রয়োগ
+      let effectOut = gated;
+
+      if (mode === "high") {
+        // চিকন কণ্ঠ (কাটা ভাব ছাড়া স্মুথ পিচ)
+        const shifted = applySmoothPitch(gated, 1.26);
+        effectOut = new Float32Array(shifted.length);
+        for (let i = 0; i < shifted.length; i++) {
+          effectOut[i] = shifted[i] * 1.1;
+        }
+      } else if (mode === "deep") {
+        // গম্ভীর কণ্ঠ
+        const shifted = applySmoothPitch(gated, 0.80);
+        effectOut = new Float32Array(shifted.length);
+        for (let i = 0; i < shifted.length; i++) {
+          lpState = lpState + 0.38 * (shifted[i] - lpState);
+          effectOut[i] = lpState * 1.15;
+        }
+      } else if (mode === "robot") {
+        // রোবট ভয়েস (কথা অক্ষুণ্ণ রেখে স্থিতিশীল মডুলেশন)
+        effectOut = new Float32Array(gated.length);
+        const carrierFreq = 80;
+        const step = (2.0 * Math.PI * carrierFreq) / 16000;
+        for (let i = 0; i < gated.length; i++) {
+          const mod = Math.sin(robotPhase);
+          robotPhase += step;
+          if (robotPhase > 2.0 * Math.PI) robotPhase -= 2.0 * Math.PI;
+          // ৬৫% স্বাভাবিক ও ৩৫% রোবট মডুলেশন যাতে শব্দ কেটে না যায়
+          effectOut[i] = gated[i] * (0.65 + 0.35 * mod) * 1.15;
+        }
+      } else if (mode === "walkie") {
+        // ওয়াকিটকি ভয়েস
+        effectOut = new Float32Array(gated.length);
+        for (let i = 0; i < gated.length; i++) {
+          lpState = lpState + 0.30 * (gated[i] - lpState);
+          const clipped = Math.max(-0.55, Math.min(0.55, lpState * 1.7));
+          effectOut[i] = clipped * 1.3;
+        }
+      }
+
+      // ৪. স্পিকার ভলিউম বুস্ট ও সফট-ক্লিপ সুরক্ষা
+      const finalOut = new Float32Array(effectOut.length);
+      for (let i = 0; i < effectOut.length; i++) {
+        finalOut[i] = Math.tanh(effectOut[i] * gainBoost);
       }
 
       return finalOut;
@@ -292,16 +330,9 @@
       if (isTalking) return;
       ensureAudioContext();
 
-      // কথা বলার সময় রিপিট/লুপ ঠেকাতে Listen অটো পজ করা
       isListening = false;
-
-      resampleCarry = new Float32Array(0);
-      resamplePos = 0;
-      robotPhase = 0;
-      lpState = 0;
-      hpState = 0;
-      prevSample = 0;
-      gateEnvelope = 0;
+      resetDspState();
+      lastMode = voiceSelect.value;
 
       try {
         micStream = await navigator.mediaDevices.getUserMedia({
@@ -315,17 +346,16 @@
         });
 
         micSource = audioCtx.createMediaStreamSource(micStream);
-        // কম লেটেন্সির জন্য 1024 বাফার
-        processor = audioCtx.createScriptProcessor(1024, 1, 1);
+        // চিকন ও রোবট ভয়েসে কাটা ভাব কমাতে 2048 বাফার
+        processor = audioCtx.createScriptProcessor(2048, 1, 1);
 
-        // নিজের ডিভাইসে মাইক্রোফোনের শব্দ লুপ হওয়া বন্ধ রাখতে 0 gain দিয়ে কানেক্ট
         muteMonitorGain = audioCtx.createGain();
         muteMonitorGain.gain.value = 0;
 
         processor.onaudioprocess = (e) => {
           if (!isTalking || ws.readyState !== WebSocket.OPEN) return;
           const input = e.inputBuffer.getChannelData(0);
-          const boost = parseFloat(txGainRange.value) || 3.2;
+          const boost = parseFloat(txGainRange.value) || 3.0;
           const processed = processOutgoingAudio(input, voiceSelect.value, boost);
 
           const pcm16 = new Int16Array(processed.length);
@@ -366,6 +396,7 @@
         micStream.getTracks().forEach((t) => t.stop());
         micStream = null;
       }
+      resetDspState();
       talkBtn.textContent = "Talk (কথা বলুন)";
       statusEl.textContent = "স্ট্যাটাস: Talk বন্ধ হয়েছে (শুনতে Listen চাপুন)";
     }

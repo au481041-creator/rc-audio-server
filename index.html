@@ -118,9 +118,11 @@
     let processor = null;
     let micSource = null;
     let muteMonitorGain = null;
+    let lastTxLog = 0;
 
     let resampleCarry = new Float32Array(0);
     let resamplePos = 0.0;
+    let txResamplePos = 0.0;
     let robotPhase = 0.0;
     let lpState = 0.0;
     let hpState = 0.0;
@@ -140,29 +142,48 @@
       statusEl.textContent = "স্ট্যাটাস: সার্ভার সংযোগ বিচ্ছিন্ন";
     };
 
-    function ensureAudioContext() {
+    async function ensureAudioContext() {
       if (!audioCtx) {
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)({
-          sampleRate: 16000
-        });
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         rxGainNode = audioCtx.createGain();
         rxGainNode.gain.value = 2.0;
         rxGainNode.connect(audioCtx.destination);
         nextPlayTime = audioCtx.currentTime;
       }
       if (audioCtx.state === "suspended") {
-        audioCtx.resume();
+        await audioCtx.resume();
       }
     }
 
     function resetDspState() {
       resampleCarry = new Float32Array(0);
       resamplePos = 0.0;
+      txResamplePos = 0.0;
       robotPhase = 0.0;
       lpState = 0.0;
       hpState = 0.0;
       prevSample = 0.0;
       gateGain = 0.0;
+    }
+
+    function resampleTo16k(samples, inputRate) {
+      if (!samples || samples.length === 0) return new Float32Array(0);
+      if (Math.abs(inputRate - 16000) < 1) return samples;
+
+      const ratio = inputRate / 16000;
+      const outLen = Math.floor(samples.length / ratio);
+      const out = new Float32Array(outLen);
+
+      let pos = txResamplePos;
+      for (let i = 0; i < outLen; i++) {
+        const idx = Math.min(samples.length - 2, Math.max(0, Math.floor(pos)));
+        const frac = pos - idx;
+        out[i] = samples[idx] * (1.0 - frac) + samples[idx + 1] * frac;
+        pos += ratio;
+      }
+      txResamplePos = pos - outLen * ratio;
+      if (txResamplePos < 0 || txResamplePos >= ratio) txResamplePos = 0;
+      return out;
     }
 
     ws.onmessage = async (event) => {
@@ -195,8 +216,8 @@
       nextPlayTime += audioBuffer.duration;
     };
 
-    listenBtn.onclick = () => {
-      ensureAudioContext();
+    listenBtn.onclick = async () => {
+      await ensureAudioContext();
       isListening = true;
       nextPlayTime = audioCtx.currentTime + 0.015;
       statusEl.textContent = "স্ট্যাটাস: লাইভ Listen চালু আছে";
@@ -241,7 +262,6 @@
         lastMode = mode;
       }
 
-      // ১. ল্যাপটপের ফ্যান ও লো-ফ্রিকোয়েন্সি ভারী আওয়াজ কমাতে শক্তিশালী হাই-পাস
       const cleanIn = new Float32Array(inputSamples.length);
       for (let i = 0; i < inputSamples.length; i++) {
         const x = inputSamples[i];
@@ -251,7 +271,6 @@
         cleanIn[i] = hp;
       }
 
-      // ২. স্মার্ট নয়েজ গেট (ফ্যানের হালকা নয়েজ আটকাতে)
       const gated = new Float32Array(cleanIn.length);
       const openThreshold = 0.022;
       const closeThreshold = 0.011;
@@ -316,7 +335,12 @@
 
     async function startTalking() {
       if (isTalking) return;
-      ensureAudioContext();
+      await ensureAudioContext();
+
+      if (ws.readyState !== WebSocket.OPEN) {
+        statusEl.textContent = "স্ট্যাটাস: সার্ভারের সাথে এখনো WebSocket যুক্ত হয়নি";
+        return;
+      }
 
       resetDspState();
       lastMode = voiceSelect.value;
@@ -325,7 +349,6 @@
         micStream = await navigator.mediaDevices.getUserMedia({
           audio: {
             channelCount: 1,
-            sampleRate: 16000,
             echoCancellation: true,
             noiseSuppression: true,
             autoGainControl: true
@@ -340,16 +363,24 @@
 
         processor.onaudioprocess = (e) => {
           if (!isTalking || ws.readyState !== WebSocket.OPEN) return;
-          const input = e.inputBuffer.getChannelData(0);
+          const rawInput = e.inputBuffer.getChannelData(0);
+          const input16k = resampleTo16k(rawInput, audioCtx.sampleRate);
           const boost = parseFloat(txGainRange.value) || 2.0;
-          const processed = processOutgoingAudio(input, voiceSelect.value, boost);
+          const processed = processOutgoingAudio(input16k, voiceSelect.value, boost);
 
           const pcm16 = new Int16Array(processed.length);
           for (let i = 0; i < processed.length; i++) {
             const s = Math.max(-1, Math.min(1, processed[i]));
             pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
           }
-          ws.send(pcm16.buffer);
+
+          if (pcm16.byteLength > 0) {
+            ws.send(pcm16.buffer);
+            if (Date.now() - lastTxLog > 1500) {
+              lastTxLog = Date.now();
+              console.log("TX sent bytes:", pcm16.byteLength);
+            }
+          }
         };
 
         micSource.connect(processor);

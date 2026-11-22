@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RC Car Two-Way Audio</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #121212;
+      color: #ffffff;
+      text-align: center;
+      padding: 40px 20px;
+    }
+    button {
+      font-size: 16px;
+      padding: 12px 22px;
+      margin: 10px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    #listenBtn {
+      background: #1e88e5;
+      color: #fff;
+    }
+    #talkBtn {
+      background: #43a047;
+      color: #fff;
+    }
+    #status {
+      margin-top: 20px;
+      color: #90caf9;
+    }
+  </style>
+</head>
+<body>
+  <h2>RC Car Audio Console</h2>
+  <p>দূর থেকে কথা বলা ও গাড়ির অডিও শোনার কন্ট্রোল প্যানেল</p>
+
+  <button id="listenBtn">Listen (শুনুন)</button>
+  <button id="talkBtn">Talk (কথা বলুন)</button>
+
+  <div id="status">স্ট্যাটাস: সংযোগ হচ্ছে...</div>
+
+  <script>
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(`${protocol}//${location.host}`);
+
+    const statusEl = document.getElementById("status");
+    const listenBtn = document.getElementById("listenBtn");
+    const talkBtn = document.getElementById("talkBtn");
+
+    let audioCtx = null;
+    let nextPlayTime = 0;
+    let isTalking = false;
+    let micStream = null;
+    let processor = null;
+    let micSource = null;
+
+    ws.onopen = () => {
+      statusEl.textContent = "স্ট্যাটাস: সার্ভারের সাথে যুক্ত হয়েছে";
+    };
+
+    ws.onclose = () => {
+      statusEl.textContent = "স্ট্যাটাস: সার্ভার সংযোগ বিচ্ছিন্ন";
+    };
+
+    function ensureAudioContext() {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({
+          sampleRate: 16000
+        });
+        nextPlayTime = audioCtx.currentTime;
+      }
+      if (audioCtx.state === "suspended") {
+        audioCtx.resume();
+      }
+    }
+
+    // আসা 16-bit PCM অডিও বাজানো
+    ws.onmessage = async (event) => {
+      if (!audioCtx || audioCtx.state !== "running") return;
+
+      const arrayBuffer = event.data instanceof Blob
+        ? await event.data.arrayBuffer()
+        : event.data;
+
+      if (!(arrayBuffer instanceof ArrayBuffer) || arrayBuffer.byteLength < 2) return;
+
+      const pcm16 = new Int16Array(arrayBuffer);
+      const float32 = new Float32Array(pcm16.length);
+      for (let i = 0; i < pcm16.length; i++) {
+        float32[i] = pcm16[i] / 32768;
+      }
+
+      const audioBuffer = audioCtx.createBuffer(1, float32.length, 16000);
+      audioBuffer.copyToChannel(float32, 0);
+
+      const source = audioCtx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(audioCtx.destination);
+
+      const now = audioCtx.currentTime;
+      if (nextPlayTime < now) {
+        nextPlayTime = now + 0.02;
+      }
+      source.start(nextPlayTime);
+      nextPlayTime += audioBuffer.duration;
+    };
+
+    listenBtn.onclick = () => {
+      ensureAudioContext();
+      statusEl.textContent = "স্ট্যাটাস: Listen চালু আছে (অডিও শোনা যাবে)";
+    };
+
+    async function startTalking() {
+      if (isTalking) return;
+      ensureAudioContext();
+
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            sampleRate: 16000,
+            echoCancellation: true,
+            noiseSuppression: true
+          }
+        });
+
+        micSource = audioCtx.createMediaStreamSource(micStream);
+        processor = audioCtx.createScriptProcessor(2048, 1, 1);
+
+        processor.onaudioprocess = (e) => {
+          if (!isTalking || ws.readyState !== WebSocket.OPEN) return;
+          const input = e.inputBuffer.getChannelData(0);
+          const pcm16 = new Int16Array(input.length);
+          for (let i = 0; i < input.length; i++) {
+            const s = Math.max(-1, Math.min(1, input[i]));
+            pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+          }
+          ws.send(pcm16.buffer);
+        };
+
+        micSource.connect(processor);
+        processor.connect(audioCtx.destination);
+
+        isTalking = true;
+        talkBtn.textContent = "Stop Talking (বন্ধ করুন)";
+        statusEl.textContent = "স্ট্যাটাস: Talk চালু আছে (মাইক্রোফোন থেকে অডিও যাচ্ছে)";
+      } catch (err) {
+        statusEl.textContent = "মাইক্রোফোন অনুমতি পাওয়া যায়নি: " + err.message;
+      }
+    }
+
+    function stopTalking() {
+      isTalking = false;
+      if (processor) {
+        processor.disconnect();
+        processor = null;
+      }
+      if (micSource) {
+        micSource.disconnect();
+        micSource = null;
+      }
+      if (micStream) {
+        micStream.getTracks().forEach((t) => t.stop());
+        micStream = null;
+      }
+      talkBtn.textContent = "Talk (কথা বলুন)";
+      statusEl.textContent = "স্ট্যাটাস: Talk বন্ধ করা হয়েছে";
+    }
+
+    talkBtn.onclick = () => {
+      if (!isTalking) startTalking();
+      else stopTalking();
+    };
+  </script>
+</body>
+</html>

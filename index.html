@@ -61,8 +61,8 @@
   <button id="talkBtn">Talk (কথা বলুন)</button>
 
   <div class="control-box">
-    <label for="txGainRange">স্পিকার ভলিউম বুস্ট (পাঠানো ভয়েস): <span id="txGainVal">1.6x</span></label>
-    <input id="txGainRange" type="range" min="1.0" max="2.4" step="0.1" value="1.6" />
+    <label for="txGainRange">পাঠানো ভয়েস লেভেল: <span id="txGainVal">1.0x</span></label>
+    <input id="txGainRange" type="range" min="0.5" max="1.6" step="0.1" value="1.0" />
   </div>
 
   <div id="status">স্ট্যাটাস: সংযোগ হচ্ছে...</div>
@@ -123,8 +123,8 @@
         source.connect(rxGainNode);
 
         const now = audioCtx.currentTime;
-        if (nextPlayTime < now || (nextPlayTime - now) > 0.08) {
-          nextPlayTime = now + 0.015;
+        if (nextPlayTime < now || (nextPlayTime - now) > 0.06) {
+          nextPlayTime = now + 0.01;
         }
         source.start(nextPlayTime);
         nextPlayTime += audioBuffer.duration;
@@ -141,7 +141,7 @@
       if (!audioCtx) {
         audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         rxGainNode = audioCtx.createGain();
-        rxGainNode.gain.value = 1.9;
+        rxGainNode.gain.value = 1.0;
         rxGainNode.connect(audioCtx.destination);
         nextPlayTime = audioCtx.currentTime;
       }
@@ -179,11 +179,10 @@
     listenBtn.onclick = async () => {
       await ensureAudioContext();
       isListening = true;
-      nextPlayTime = audioCtx.currentTime + 0.015;
+      nextPlayTime = audioCtx.currentTime + 0.01;
       statusEl.textContent = "স্ট্যাটাস: লাইভ Listen চালু আছে";
     };
 
-    // পুরো বাফারের পিক দেখে কথা থামার সাথে সাথে একদম 0 করে দেয় যাতে ঘেরঘের না থাকে
     function processOutgoingAudio(inputSamples, gainBoost) {
       const filtered = new Float32Array(inputSamples.length);
       let peak = 0.0;
@@ -198,15 +197,15 @@
         if (a > peak) peak = a;
       }
 
-      if (peak < 0.032) {
+      if (peak < 0.045) {
         return new Float32Array(inputSamples.length);
       }
 
       const out = new Float32Array(inputSamples.length);
       for (let i = 0; i < inputSamples.length; i++) {
-        let v = filtered[i] * gainBoost * 1.25;
-        if (v > 0.78) v = 0.78;
-        if (v < -0.78) v = -0.78;
+        let v = filtered[i] * gainBoost;
+        if (v > 0.65) v = 0.65;
+        if (v < -0.65) v = -0.65;
         out[i] = v;
       }
       return out;
@@ -229,12 +228,12 @@
             channelCount: 1,
             echoCancellation: true,
             noiseSuppression: true,
-            autoGainControl: true
+            autoGainControl: false
           }
         });
 
         micSource = audioCtx.createMediaStreamSource(micStream);
-        processor = audioCtx.createScriptProcessor(4096, 1, 1);
+        processor = audioCtx.createScriptProcessor(2048, 1, 1);
 
         muteMonitorGain = audioCtx.createGain();
         muteMonitorGain.gain.value = 0;
@@ -243,7 +242,7 @@
           if (!isTalking || !ws || ws.readyState !== WebSocket.OPEN) return;
           const rawInput = e.inputBuffer.getChannelData(0);
           const input16k = resampleTo16k(rawInput, audioCtx.sampleRate);
-          const boost = parseFloat(txGainRange.value) || 1.6;
+          const boost = parseFloat(txGainRange.value) || 1.0;
           const processed = processOutgoingAudio(input16k, boost);
 
           const pcm16 = new Int16Array(processed.length);

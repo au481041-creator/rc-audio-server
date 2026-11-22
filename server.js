@@ -11,7 +11,7 @@ const server = http.createServer((req, res) => {
     fs.readFile(htmlPath, (err, data) => {
       if (err) {
         res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
-        res.end("index.html পাওয়া যায়নি");
+        res.end("index.html পাওয়া যায়নি");
         return;
       }
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
@@ -23,10 +23,16 @@ const server = http.createServer((req, res) => {
   }
 });
 
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ noServer: true });
+
+server.on("upgrade", (req, socket, head) => {
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit("connection", ws, req);
+  });
+});
 
 wss.on("connection", (ws) => {
-  console.log("একটি ক্লায়েন্ট কানেক্ট হয়েছে");
+  console.log("একটি ক্লায়েন্ট কানেক্ট হয়েছে");
 
   ws.on("message", (message, isBinary) => {
     wss.clients.forEach((client) => {
@@ -37,10 +43,10 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
-    console.log("একটি ক্লায়েন্ট ডিসকানেক্ট হয়েছে");
+    console.log("একটি ক্লায়েন্ট ডিসকানেক্ট হয়েছে");
   });
 });
 
 server.listen(PORT, () => {
-  console.log(`সার্ভার চালু হয়েছে: http://localhost:${PORT}`);
+  console.log(`সার্ভার চালু হয়েছে: http://localhost:${PORT}`);
 });

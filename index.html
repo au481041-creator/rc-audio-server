@@ -1,175 +1,288 @@
-#include <WiFi.h>
-#include <WebSocketsClient_Generic.h>
-#include <driver/i2s.h>
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RC Car Live Two-Way Audio</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #121212;
+      color: #ffffff;
+      text-align: center;
+      padding: 40px 20px;
+    }
+    button {
+      font-size: 16px;
+      padding: 12px 22px;
+      margin: 10px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    #listenBtn {
+      background: #1e88e5;
+      color: #fff;
+    }
+    #talkBtn {
+      background: #43a047;
+      color: #fff;
+    }
+    .control-box {
+      margin: 16px auto;
+      max-width: 360px;
+      background: #1e1e1e;
+      padding: 14px 16px;
+      border-radius: 10px;
+      border: 1px solid #333;
+    }
+    .control-box label {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 14px;
+      color: #bbdefb;
+    }
+    input[type="range"] {
+      width: 100%;
+      margin-top: 4px;
+      cursor: pointer;
+    }
+    #status {
+      margin-top: 20px;
+      color: #90caf9;
+    }
+  </style>
+</head>
+<body>
+  <h2>RC Car Live Audio Console</h2>
+  <p>লাইভ কথা বলা ও গাড়ির অডিও শোনার কন্ট্রোল প্যানেল</p>
 
-// ======= ১. Wi-Fi ও Render WSS তথ্য =======
-const char* ssid = "TP-Link_760A";
-const char* password = "40437842";
-const char* wss_host = "rc-audio-server.onrender.com";
-const uint16_t wss_port = 443;
-const char* wss_path = "/";
+  <button id="listenBtn">Listen (শুনুন)</button>
+  <button id="talkBtn">Talk (কথা বলুন)</button>
 
-// ======= ২. আপনার Blynk তথ্য =======
-#define BLYNK_TEMPLATE_ID "TMPL6ObcEdEw0"
-#define BLYNK_TEMPLATE_NAME "rc baby bd car"
-const char* blynk_auth_token = "Q0aTLIFg5XSUSNWcqMopcBAR6Cni6NEZ";
+  <div class="control-box">
+    <label for="txGainRange">পাঠানো ভয়েস লেভেল: <span id="txGainVal">1.3x</span></label>
+    <input id="txGainRange" type="range" min="0.6" max="1.8" step="0.1" value="1.3" />
+  </div>
 
-// INMP441 মাইক্রোফোন পিন (I2S_NUM_0)
-#define MIC_WS  41
-#define MIC_SCK 42
-#define MIC_SD  2
+  <div id="status">স্ট্যাটাস: সংযোগ হচ্ছে...</div>
 
-// I2S অ্যামপ্লিফায়ার পিন (I2S_NUM_1)
-#define SPK_BCLK 15
-#define SPK_LRC  7
-#define SPK_DIN  6
+  <script>
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    let ws = null;
 
-#define SAMPLE_RATE 16000
-#define BUFFER_SAMPLES 512
-#define RX_BUF_SAMPLES 2048
+    const statusEl = document.getElementById("status");
+    const listenBtn = document.getElementById("listenBtn");
+    const talkBtn = document.getElementById("talkBtn");
+    const txGainRange = document.getElementById("txGainRange");
+    const txGainVal = document.getElementById("txGainVal");
 
-WebSocketsClient webSocket;
-bool wssConnected = false;
-unsigned long lastSendTime = 0;
+    let audioCtx = null;
+    let rxGainNode = null;
+    let nextPlayTime = 0;
+    let isTalking = false;
+    let isListening = false;
+    let micStream = null;
+    let processor = null;
+    let micSource = null;
+    let muteMonitorGain = null;
 
-int32_t raw_mic_buf[BUFFER_SAMPLES];
-int16_t pcm_tx_buf[BUFFER_SAMPLES];
-int16_t pcm_rx_buf[RX_BUF_SAMPLES];
+    let txResamplePos = 0.0;
+    let hpState = 0.0;
+    let prevSample = 0.0;
 
-float hp_prev_in = 0.0f;
-float hp_prev_out = 0.0f;
+    function connectWS() {
+      ws = new WebSocket(`${protocol}//${location.host}`);
+      ws.binaryType = "arraybuffer";
 
-void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
-  switch (type) {
-    case WStype_DISCONNECTED:
-      wssConnected = false;
-      Serial.println("WSS সংযোগ বিচ্ছিন্ন হয়েছে।");
-      break;
+      ws.onopen = () => {
+        statusEl.textContent = "স্ট্যাটাস: সার্ভারের সাথে যুক্ত হয়েছে";
+      };
 
-    case WStype_CONNECTED:
-      wssConnected = true;
-      Serial.println("Render WSS সার্ভারের সাথে যুক্ত হয়েছে!");
-      break;
+      ws.onclose = () => {
+        statusEl.textContent = "স্ট্যাটাস: সংযোগ বিচ্ছিন্ন, আবার যুক্ত হচ্ছে...";
+        setTimeout(connectWS, 2000);
+      };
 
-    case WStype_BIN: {
-      if (length < 4 || length > sizeof(pcm_rx_buf)) return;
-      memcpy(pcm_rx_buf, payload, length);
-      int samples = length / 2;
+      ws.onmessage = async (event) => {
+        if (!isListening || !audioCtx || audioCtx.state !== "running") return;
+        const arrayBuffer = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
+        if (!(arrayBuffer instanceof ArrayBuffer) || arrayBuffer.byteLength < 2) return;
 
-      for (int i = 0; i < samples; i++) {
-        int32_t s = (int32_t)((float)pcm_rx_buf[i] * 1.35f);
-        if (s > 24000) s = 24000;
-        if (s < -24000) s = -24000;
-        pcm_rx_buf[i] = (int16_t)s;
-      }
+        const pcm16 = new Int16Array(arrayBuffer);
+        const float32 = new Float32Array(pcm16.length);
+        for (let i = 0; i < pcm16.length; i++) {
+          float32[i] = pcm16[i] / 32768;
+        }
 
-      size_t bytes_written = 0;
-      i2s_write(I2S_NUM_1, pcm_rx_buf, samples * 2, &bytes_written, pdMS_TO_TICKS(5));
-      break;
+        const audioBuffer = audioCtx.createBuffer(1, float32.length, 16000);
+        audioBuffer.copyToChannel(float32, 0);
+
+        const source = audioCtx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(rxGainNode);
+
+        const now = audioCtx.currentTime;
+        if (nextPlayTime < now || (nextPlayTime - now) > 0.06) {
+          nextPlayTime = now + 0.01;
+        }
+        source.start(nextPlayTime);
+        nextPlayTime += audioBuffer.duration;
+      };
     }
 
-    default:
-      break;
-  }
-}
+    connectWS();
 
-void setupMicI2S() {
-  i2s_config_t mic_config = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-    .sample_rate = SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 4,
-    .dma_buf_len = BUFFER_SAMPLES,
-    .use_apll = false
-  };
-  i2s_pin_config_t mic_pins = {
-    .bck_io_num = MIC_SCK,
-    .ws_io_num = MIC_WS,
-    .data_out_num = I2S_PIN_NO_CHANGE,
-    .data_in_num = MIC_SD
-  };
-  i2s_driver_install(I2S_NUM_0, &mic_config, 0, NULL);
-  i2s_set_pin(I2S_NUM_0, &mic_pins);
-}
+    txGainRange.oninput = () => {
+      txGainVal.textContent = `${parseFloat(txGainRange.value).toFixed(1)}x`;
+    };
 
-void setupSpeakerI2S() {
-  i2s_config_t spk_config = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-    .sample_rate = SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 6,
-    .dma_buf_len = BUFFER_SAMPLES,
-    .use_apll = false
-  };
-  i2s_pin_config_t spk_pins = {
-    .bck_io_num = SPK_BCLK,
-    .ws_io_num = SPK_LRC,
-    .data_out_num = SPK_DIN,
-    .data_in_num = I2S_PIN_NO_CHANGE
-  };
-  i2s_driver_install(I2S_NUM_1, &spk_config, 0, NULL);
-  i2s_set_pin(I2S_NUM_1, &spk_pins);
-}
-
-void setup() {
-  Serial.begin(115200);
-  delay(500);
-
-  WiFi.begin(ssid, password);
-  Serial.print("WiFi যুক্ত হচ্ছে");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nWiFi যুক্ত হয়েছে! IP: " + WiFi.localIP().toString());
-
-  setupMicI2S();
-  setupSpeakerI2S();
-
-  Serial.println("Render WSS সার্ভারে যুক্ত হচ্ছে...");
-  webSocket.beginSSL(wss_host, wss_port, wss_path);
-  webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(4000);
-}
-
-void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
-    return;
-  }
-
-  webSocket.loop();
-
-  if (wssConnected && (millis() - lastSendTime >= 30)) {
-    lastSendTime = millis();
-
-    size_t bytes_read = 0;
-    esp_err_t err = i2s_read(I2S_NUM_0, raw_mic_buf, sizeof(raw_mic_buf), &bytes_read, pdMS_TO_TICKS(10));
-    if (err == ESP_OK && bytes_read >= 4 && wssConnected) {
-      int samples_read = bytes_read / 4;
-
-      float max_amp = 0.0f;
-      for (int i = 0; i < samples_read; i++) {
-        float x = (float)(raw_mic_buf[i] >> 12) / 32768.0f;
-        float hp = 0.985f * (hp_prev_out + x - hp_prev_in);
-        hp_prev_in = x;
-        hp_prev_out = hp;
-        pcm_tx_buf[i] = (int16_t)(hp * 22000.0f);
-        float a = fabsf(hp);
-        if (a > max_amp) max_amp = a;
+    async function ensureAudioContext() {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        rxGainNode = audioCtx.createGain();
+        rxGainNode.gain.value = 1.2;
+        rxGainNode.connect(audioCtx.destination);
+        nextPlayTime = audioCtx.currentTime;
       }
-
-      if (max_amp < 0.035f) {
-        memset(pcm_tx_buf, 0, samples_read * 2);
+      if (audioCtx.state === "suspended") {
+        await audioCtx.resume();
       }
-
-      webSocket.sendBIN((uint8_t*)pcm_tx_buf, samples_read * 2);
     }
-  }
-}
+
+    function resetDspState() {
+      txResamplePos = 0.0;
+      hpState = 0.0;
+      prevSample = 0.0;
+    }
+
+    function resampleTo16k(samples, inputRate) {
+      if (!samples || samples.length === 0) return new Float32Array(0);
+      if (Math.abs(inputRate - 16000) < 1) return samples;
+
+      const ratio = inputRate / 16000;
+      const outLen = Math.floor(samples.length / ratio);
+      const out = new Float32Array(outLen);
+
+      let pos = txResamplePos;
+      for (let i = 0; i < outLen; i++) {
+        const idx = Math.min(samples.length - 2, Math.max(0, Math.floor(pos)));
+        const frac = pos - idx;
+        out[i] = samples[idx] * (1.0 - frac) + samples[idx + 1] * frac;
+        pos += ratio;
+      }
+      txResamplePos = pos - outLen * ratio;
+      if (txResamplePos < 0 || txResamplePos >= ratio) txResamplePos = 0;
+      return out;
+    }
+
+    listenBtn.onclick = async () => {
+      await ensureAudioContext();
+      isListening = true;
+      nextPlayTime = audioCtx.currentTime + 0.01;
+      statusEl.textContent = "স্ট্যাটাস: লাইভ Listen চালু আছে";
+    };
+
+    function processOutgoingAudio(inputSamples, gainBoost) {
+      const filtered = new Float32Array(inputSamples.length);
+      let peak = 0.0;
+
+      for (let i = 0; i < inputSamples.length; i++) {
+        const x = inputSamples[i];
+        const hp = 0.985 * (hpState + x - prevSample);
+        hpState = hp;
+        prevSample = x;
+        filtered[i] = hp;
+        const a = Math.abs(hp);
+        if (a > peak) peak = a;
+      }
+
+      if (peak < 0.040) {
+        return new Float32Array(inputSamples.length);
+      }
+
+      const out = new Float32Array(inputSamples.length);
+      for (let i = 0; i < inputSamples.length; i++) {
+        let v = filtered[i] * gainBoost;
+        if (v > 0.72) v = 0.72;
+        if (v < -0.72) v = -0.72;
+        out[i] = v;
+      }
+      return out;
+    }
+
+    async function startTalking() {
+      if (isTalking) return;
+      await ensureAudioContext();
+
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        statusEl.textContent = "স্ট্যাটাস: WebSocket যুক্ত নয়, একটু অপেক্ষা করুন";
+        return;
+      }
+
+      resetDspState();
+
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: false
+          }
+        });
+
+        micSource = audioCtx.createMediaStreamSource(micStream);
+        processor = audioCtx.createScriptProcessor(2048, 1, 1);
+
+        muteMonitorGain = audioCtx.createGain();
+        muteMonitorGain.gain.value = 0;
+
+        processor.onaudioprocess = (e) => {
+          if (!isTalking || !ws || ws.readyState !== WebSocket.OPEN) return;
+          const rawInput = e.inputBuffer.getChannelData(0);
+          const input16k = resampleTo16k(rawInput, audioCtx.sampleRate);
+          const boost = parseFloat(txGainRange.value) || 1.3;
+          const processed = processOutgoingAudio(input16k, boost);
+
+          const pcm16 = new Int16Array(processed.length);
+          for (let i = 0; i < processed.length; i++) {
+            const s = Math.max(-1, Math.min(1, processed[i]));
+            pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+          }
+
+          if (pcm16.byteLength > 0) {
+            ws.send(pcm16.buffer);
+          }
+        };
+
+        micSource.connect(processor);
+        processor.connect(muteMonitorGain);
+        muteMonitorGain.connect(audioCtx.destination);
+
+        isTalking = true;
+        talkBtn.textContent = "Stop Talking (বন্ধ করুন)";
+        statusEl.textContent = "স্ট্যাটাস: লাইভ Talk চালু";
+      } catch (err) {
+        statusEl.textContent = "মাইক্রোফোন অনুমতি পাওয়া যায়নি: " + err.message;
+      }
+    }
+
+    function stopTalking() {
+      isTalking = false;
+      if (processor) { processor.disconnect(); processor = null; }
+      if (muteMonitorGain) { muteMonitorGain.disconnect(); muteMonitorGain = null; }
+      if (micSource) { micSource.disconnect(); micSource = null; }
+      if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
+      resetDspState();
+      talkBtn.textContent = "Talk (কথা বলুন)";
+      statusEl.textContent = "স্ট্যাটাস: Talk বন্ধ হয়েছে";
+    }
+
+    talkBtn.onclick = () => {
+      if (!isTalking) startTalking();
+      else stopTalking();
+    };
+  </script>
+</body>
+</html>
